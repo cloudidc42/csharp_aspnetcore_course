@@ -753,6 +753,230 @@ Console.WriteLine("  ✓ Delete_NonExistentProduct_Returns404");
 
 ---
 
+## Advanced Integration Testing Techniques
+
+### Test Ordering
+
+บางครั้ง tests ต้องทำงานตามลำดับ xUnit รองรับด้วย `TestCaseOrderer`
+
+```csharp
+// กำหนดลำดับ test ด้วย attribute
+[Collection("OrderedTests")]
+public class OrderedIntegrationTests : IClassFixture<WebApplicationFactory<Program>>
+{
+    private readonly HttpClient _client;
+    private static Guid _createdProductId;
+    
+    public OrderedIntegrationTests(WebApplicationFactory<Program> factory)
+    {
+        _client = factory.CreateClient();
+    }
+    
+    [Fact, TestPriority(1)]
+    public async Task Step1_CreateProduct_Returns201()
+    {
+        var response = await _client.PostAsync("/api/products",
+            JsonContent.Create(new { Name = "Test Product", Price = 100m, Stock = 10 }));
+        response.EnsureSuccessStatusCode();
+        
+        var product = await response.Content.ReadFromJsonAsync<ProductResponseDto>();
+        _createdProductId = product!.Id;
+        
+        Assert.NotEqual(Guid.Empty, _createdProductId);
+    }
+    
+    [Fact, TestPriority(2)]
+    public async Task Step2_GetCreatedProduct_ReturnsProduct()
+    {
+        Assert.NotEqual(Guid.Empty, _createdProductId);
+        
+        var response = await _client.GetAsync($"/api/products/{_createdProductId}");
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+    }
+    
+    [Fact, TestPriority(3)]
+    public async Task Step3_DeleteProduct_Returns204()
+    {
+        var response = await _client.DeleteAsync($"/api/products/{_createdProductId}");
+        Assert.Equal(HttpStatusCode.NoContent, response.StatusCode);
+    }
+}
+
+[AttributeUsage(AttributeTargets.Method)]
+public class TestPriorityAttribute : Attribute
+{
+    public TestPriorityAttribute(int priority) => Priority = priority;
+    public int Priority { get; }
+}
+```
+
+### Testing Middleware
+
+```csharp
+public class MiddlewareIntegrationTests : IClassFixture<WebApplicationFactory<Program>>
+{
+    private readonly HttpClient _client;
+    
+    public MiddlewareIntegrationTests(WebApplicationFactory<Program> factory)
+    {
+        _client = factory.CreateClient();
+    }
+    
+    [Fact]
+    public async Task RequestLoggingMiddleware_AddsCorrelationIdHeader()
+    {
+        var response = await _client.GetAsync("/api/products");
+        
+        // ตรวจสอบว่า middleware เพิ่ม header
+        Assert.True(response.Headers.Contains("X-Correlation-Id"));
+    }
+    
+    [Fact]
+    public async Task ExceptionHandlingMiddleware_UnhandledException_ReturnsProblemDetails()
+    {
+        // เรียก endpoint ที่จะ throw exception
+        var response = await _client.GetAsync("/api/test/error");
+        
+        Assert.Equal(HttpStatusCode.InternalServerError, response.StatusCode);
+        
+        var problem = await response.Content.ReadFromJsonAsync<ProblemDetails>();
+        Assert.NotNull(problem);
+        Assert.Equal(500, problem.Status);
+    }
+    
+    [Fact]
+    public async Task CorsMiddleware_WithAllowedOrigin_AddsHeaders()
+    {
+        var request = new HttpRequestMessage(HttpMethod.Get, "/api/products");
+        request.Headers.Add("Origin", "https://allowed-origin.com");
+        
+        var response = await _client.SendAsync(request);
+        
+        Assert.True(response.Headers.Contains("Access-Control-Allow-Origin"));
+    }
+}
+```
+
+### Testing with Real Database (TestContainers)
+
+```csharp
+// ติดตั้ง: dotnet add package Testcontainers.PostgreSql
+// ให้ใช้ real PostgreSQL ใน Docker สำหรับ Integration Tests
+
+public class PostgreSqlIntegrationTests : IAsyncLifetime
+{
+    private PostgreSqlContainer _postgres = null!;
+    private WebApplicationFactory<Program> _factory = null!;
+    private HttpClient _client = null!;
+    
+    public async Task InitializeAsync()
+    {
+        // สร้าง PostgreSQL container
+        _postgres = new PostgreSqlBuilder()
+            .WithDatabase("testdb")
+            .WithUsername("testuser")
+            .WithPassword("testpass")
+            .Build();
+        
+        await _postgres.StartAsync();
+        
+        _factory = new WebApplicationFactory<Program>()
+            .WithWebHostBuilder(builder =>
+            {
+                builder.ConfigureServices(services =>
+                {
+                    // ใช้ connection string จาก container
+                    var descriptor = services.SingleOrDefault(
+                        d => d.ServiceType == typeof(DbContextOptions<AppDbContext>));
+                    if (descriptor != null) services.Remove(descriptor);
+                    
+                    services.AddDbContext<AppDbContext>(options =>
+                        options.UseNpgsql(_postgres.GetConnectionString()));
+                });
+            });
+        
+        _client = _factory.CreateClient();
+        
+        // Run migrations
+        using var scope = _factory.Services.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        await db.Database.MigrateAsync();
+    }
+    
+    public async Task DisposeAsync()
+    {
+        _client?.Dispose();
+        _factory?.Dispose();
+        await _postgres.StopAsync();
+        await _postgres.DisposeAsync();
+    }
+    
+    [Fact]
+    public async Task Create_WithRealPostgres_PersistsData()
+    {
+        var createDto = new { Name = "Real DB Product", Price = 999m, Stock = 5 };
+        
+        var createResponse = await _client.PostAsync(
+            "/api/products", JsonContent.Create(createDto));
+        createResponse.EnsureSuccessStatusCode();
+        
+        var created = await createResponse.Content.ReadFromJsonAsync<ProductResponseDto>();
+        
+        // Query directly from database
+        using var scope = _factory.Services.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var product = await db.Products.FindAsync(created!.Id);
+        
+        Assert.NotNull(product);
+        Assert.Equal("Real DB Product", product.Name);
+    }
+}
+```
+
+### Snapshot Testing
+
+```csharp
+// การทดสอบที่ compare response กับ "snapshot" ที่บันทึกไว้
+public class SnapshotTests : IClassFixture<WebApplicationFactory<Program>>
+{
+    private readonly HttpClient _client;
+    
+    public SnapshotTests(WebApplicationFactory<Program> factory)
+    {
+        _client = factory.CreateClient();
+    }
+    
+    [Fact]
+    public async Task GetProducts_ResponseMatchesSnapshot()
+    {
+        var response = await _client.GetAsync("/api/products");
+        var content = await response.Content.ReadAsStringAsync();
+        
+        // Save snapshot ครั้งแรก หรือ compare กับที่มีอยู่
+        var snapshotPath = "Snapshots/get_products.json";
+        
+        if (!File.Exists(snapshotPath))
+        {
+            Directory.CreateDirectory("Snapshots");
+            await File.WriteAllTextAsync(snapshotPath, content);
+            return; // ครั้งแรก save snapshot
+        }
+        
+        var expected = await File.ReadAllTextAsync(snapshotPath);
+        
+        // Normalize JSON สำหรับ comparison
+        var expectedJson = JsonDocument.Parse(expected);
+        var actualJson = JsonDocument.Parse(content);
+        
+        Assert.Equal(
+            JsonSerializer.Serialize(expectedJson, new JsonSerializerOptions { WriteIndented = true }),
+            JsonSerializer.Serialize(actualJson, new JsonSerializerOptions { WriteIndented = true }));
+    }
+}
+```
+
+---
+
 ## สรุป
 
 Integration Testing ด้วย WebApplicationFactory ช่วยให้เรา:
@@ -761,6 +985,8 @@ Integration Testing ด้วย WebApplicationFactory ช่วยให้เ�
 - **Test authentication/authorization** flows
 - **ยืนยัน response format** และ status codes
 - **IAsyncLifetime** สำหรับ async setup/teardown
+- **TestContainers** สำหรับ test กับ database จริงใน Docker
+- **Middleware testing** ตรวจสอบ headers และ error handling
 
 ---
 
